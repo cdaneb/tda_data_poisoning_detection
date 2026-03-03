@@ -137,6 +137,29 @@ python -m src.experiments.run_experiment \
 - `detection_score_over_time.png`: detection score vs threshold over time, poisoning window shaded.
 - `tda_features_over_time.png`: selected TDA features (e.g. `h1_max_persistence`, `h0_max_persistence`) vs time, poisoning window shaded.
 
+### Run clean baseline
+
+For a publication-quality *clean* baseline on CICIDS2017 with robust calibration and empirical thresholding, run from the project root:
+
+```bash
+python -m src.experiments.run_clean_baseline --seed 0 --day Monday --max-rows 20000
+```
+
+This writes artifacts under `outputs/clean/seed_<seed>/`, for example `outputs/clean/seed_0/`:
+
+- `window_metrics.csv`: one row per evaluation window with:
+  - `t`, `window_id`
+  - model metrics: `accuracy`, `balanced_accuracy`, `precision_1`, `recall_1`, `f1_1`, `tp`, `fp`, `tn`, `fn`, `attack_prevalence`
+  - TDA features: `h0_max_persistence`, `h0_count`, `h0_entropy`, `h1_max_persistence`, `h1_count`, `h1_entropy`
+  - detection fields: `anomaly_score`, `threshold_used`, `flagged_window`, `consecutive_flags`, `h1_nonempty`
+  - PCA metadata: `pca_requested`, `pca_effective`, `pca_clamped`, `pca_disabled`, `dr_method`
+- `baseline_params.json`: JSON snapshot containing:
+  - `config_snapshot`: clean-baseline config and dataset metadata
+  - `pca`: effective dimensionality, clamping/disabled flags, and optional explained variance ratios
+  - `calibrator`: feature-wise centers/scales for the robust z-score baseline
+  - `threshold`: mode, quantile, and calibrated threshold value
+  - `summary`: warmup/calibration window counts, windows evaluated, flagged windows, flag rate, H1 non-empty frequency, and anomaly score percentiles (p95, p99, p99.5)
+
 ## Repository cleanup
 
 To remove generated junk (caches, bytecode, and duplicate run artifacts) without touching core source or data, run from the project root:
