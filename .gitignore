@@ -1,0 +1,38 @@
+.# Python bytecode and caches
+__pycache__/
+*.pyc
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Pytest and other caches
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Notebook archives (not part of main workflow)
+notebooks/_archive/
+
+# Experiment outputs and large artifacts
+outputs/
+results/
+*.npz
+*.npy
+
+# Local data (large CICIDS CSVs and archive)
+data/cicids2017/
+MachineLearningCSV.zip
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Editor configuration (local only)
+.vscode/
+
