@@ -79,14 +79,20 @@ class TDAMonitor:
         # RNG for any stochastic components (e.g. PCA subsampling).
         self._rng = np.random.default_rng(random_state)
 
-        # Calibration state.
+        # Calibration state (12 features: 6 per dimension).
         self._feature_names = [
             "h0_max_persistence",
             "h0_count",
             "h0_entropy",
+            "h0_wasserstein_amplitude",
+            "h0_landscape_amplitude",
+            "h0_betti_curve_mean",
             "h1_max_persistence",
             "h1_count",
             "h1_entropy",
+            "h1_wasserstein_amplitude",
+            "h1_landscape_amplitude",
+            "h1_betti_curve_mean",
         ]
         self._baseline_rows: List[Dict[str, float]] = []
         self._calibration_scores: List[float] = []
@@ -220,9 +226,15 @@ class TDAMonitor:
             "h0_max_persistence": _get(0, "max_persistence"),
             "h0_count": _get(0, "count"),
             "h0_entropy": _get(0, "entropy"),
+            "h0_wasserstein_amplitude": _get(0, "wasserstein_amplitude"),
+            "h0_landscape_amplitude": _get(0, "landscape_amplitude"),
+            "h0_betti_curve_mean": _get(0, "betti_curve_mean"),
             "h1_max_persistence": _get(1, "max_persistence"),
             "h1_count": _get(1, "count"),
             "h1_entropy": _get(1, "entropy"),
+            "h1_wasserstein_amplitude": _get(1, "wasserstein_amplitude"),
+            "h1_landscape_amplitude": _get(1, "landscape_amplitude"),
+            "h1_betti_curve_mean": _get(1, "betti_curve_mean"),
         }
 
         if features["h1_count"] == 0.0:
@@ -248,19 +260,34 @@ class TDAMonitor:
         return self._calibrator.transform_dict(features)
 
     def _select_score_coordinates(self, z: np.ndarray, features: Dict[str, float]) -> np.ndarray:
-        """Select which coordinates to use for scoring based on score_from."""
-        h0_idx = [0, 1, 2]
-        h1_idx = [3, 4, 5]
+        """Select which coordinates to use for scoring based on score_from.
+
+        With 12 features: H0 block = 0..5, H1 block = 6..11.
+        h1_then_h0: original 3 per dimension [0,1,2] and [6,7,8].
+        h1_extended: 4 features (max_persistence, count, entropy, wasserstein_amplitude):
+            H1 = [6,7,8,9], H0 fallback = [0,1,2,3] when H1 is empty."""
+        h0_idx = [0, 1, 2]   # max_persistence, count, entropy
+        h1_idx = [6, 7, 8]   # same for H1
+        h0_extended = [0, 1, 2, 3]   # + wasserstein_amplitude
+        h1_extended = [6, 7, 8, 9]   # + wasserstein_amplitude
 
         mode = self.score_from
+        if mode == "all":
+            return z
         if mode == "h0_only":
             return z[h0_idx]
         if mode == "h1_only":
             return z[h1_idx]
-        # Default: h1_then_h0.
-        if features.get("h1_count", 0.0) and features.get("h1_max_persistence", 0.0):
-            return z[h1_idx]
-        return z[h0_idx]
+        if mode == "h1_then_h0":
+            if features.get("h1_count", 0.0) and features.get("h1_max_persistence", 0.0):
+                return z[h1_idx]
+            return z[h0_idx]
+        if mode == "h1_extended":
+            if features.get("h1_count", 0.0) and features.get("h1_max_persistence", 0.0):
+                return z[h1_extended]
+            return z[h0_extended]
+        # Default: same as h1_then_h0 for backwards compatibility.
+        return z
 
     def _aggregate_score(self, z_sel: np.ndarray) -> float:
         if self.score_mode == "weighted_sum":

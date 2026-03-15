@@ -47,10 +47,17 @@ class PoisoningAttack:
                 raise ValueError("trigger_dims must contain non-negative integers.")
 
     def is_active(self, t: int) -> bool:
-        """Return True if the attack is active at timestep ``t``."""
-        if self.start_t is None or self.end_t is None:
+        """Return True if the attack is active at timestep ``t``.
+
+        When end_t is None, the attack is active for all t >= start_t (one-way).
+        """
+        if self.start_t is None:
             return False
-        return int(self.start_t) <= int(t) <= int(self.end_t)
+        t = int(t)
+        start = int(self.start_t)
+        if self.end_t is None:
+            return t >= start
+        return start <= t <= int(self.end_t)
 
     def _maybe_poison(self) -> bool:
         """Return True with probability poison_rate."""

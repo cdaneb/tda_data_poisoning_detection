@@ -39,17 +39,31 @@ class ExperimentConfig:
     window_size: int = 50
     stride: int = 10
     point_cloud_mode: str = "residuals"
-    warmup_windows: int = 5
-    threshold: float = 3.0
+    warmup_windows: int = 50
+    calibration_windows: int = 50
+    threshold_quantile: float = 0.995
     k_consecutive: int = 2
     tda_threshold: float = 0.1
     maxdim: int = 1
     eval_every: int = 50
+    # Threshold: unused when threshold_mode is empirical_quantile (must be derived from calibration).
+    threshold: float = 0.0
+    threshold_mode: str = "empirical_quantile"
+    dr_method: str = "pca"
+    pca_n_components: int | None = 15
+    pca_variance: float | None = None
+    pca_max_components: int = 20
+    pca_max_points_per_window: int = 50
+    pca_strict: bool = False
+    baseline_mode: str = "robust_z"
+    score_mode: str = "l2"
+    score_from: str = "h1_then_h0"
+
     poison_mode: str = "label_flip"
-    poison_start_t: int | None = 800
-    poison_end_t: int | None = 1200
+    poison_start_t: int | None = 4000
+    poison_end_t: int | None = None  # None = one-way, stays poisoned to end
     poison_rate: float = 0.3
-    poison_target_class: int | None = None
+    poison_target_class: int | None = 0  # flip benign (0) -> attack (1)
     trigger_value: float = 0.5
     trigger_dims: List[int] = field(default_factory=lambda: [0])
     poison_target_label: int = 1
@@ -63,7 +77,7 @@ class ExperimentConfig:
     label_col: str = "Label"
     benign_label: str | int = "BENIGN"
     time_col: str = "Timestamp"
-    max_rows: int | None = None
+    max_rows: int | None = 20000
 
     # Drift configuration.
     drift_start_t: int | None = None
@@ -92,10 +106,12 @@ def _compute_recent_poison_rate(buffer: WindowBuffer, window: int = 100) -> floa
 
 def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
     """Run the streaming poisoning experiment and return basic metadata."""
-    # Output directory layout:
-    # base output_dir / <condition> / seed_<seed>/
+    # Output directory: use config.output_dir as run root when custom (e.g. outputs/label_flip/rate_0.05/seed_0).
     base_output = Path(config.output_dir)
-    run_output = base_output / str(config.condition) / f"seed_{config.seed}"
+    if config.output_dir.strip() != "outputs":
+        run_output = base_output
+    else:
+        run_output = base_output / str(config.condition) / f"seed_{config.seed}"
     run_output.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -182,13 +198,27 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         window_buffer=buffer,
         threshold=config.threshold,
         warmup_windows=config.warmup_windows,
+        calibration_windows=config.calibration_windows,
         k_consecutive=config.k_consecutive,
         point_cloud_mode=config.point_cloud_mode,
         tda_threshold=config.tda_threshold,
         maxdim=config.maxdim,
+        dr_method=config.dr_method,
+        pca_n_components=config.pca_n_components,
+        pca_variance=config.pca_variance,
+        pca_max_components=config.pca_max_components,
+        pca_max_points_per_window=config.pca_max_points_per_window,
+        pca_strict=config.pca_strict,
+        baseline_mode=config.baseline_mode,
+        threshold_mode=config.threshold_mode,
+        threshold_quantile=config.threshold_quantile,
+        score_mode=config.score_mode,
+        score_from=config.score_from,
+        random_state=config.random_state,
     )
 
     metrics_rows: List[Dict[str, Any]] = []
+    flip_count = 0  # number of training samples whose label was actually flipped by the attack
 
     # Main streaming loop.
     for t_stream, x, y in stream:
@@ -214,15 +244,16 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         else:
             x_for_attack = x_scaled
 
-        # Optional poisoning.
+        # Optional poisoning (one-way when poison_end_t is None: active for t >= poison_start_t).
         poisoning_enabled = (
             config.condition in {"label_flip", "trigger", "drift_poison"}
             and config.poison_start_t is not None
-            and config.poison_end_t is not None
             and config.poison_rate > 0.0
         )
         if poisoning_enabled:
             x_used, y_used, poisoned = attack.apply(x_for_attack, int(y), t_stream)
+            if poisoned:
+                flip_count += 1
         else:
             x_used, y_used, poisoned = x_for_attack, int(y), False
 
@@ -267,23 +298,50 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
     tda_path = run_output / "tda_features.csv"
     tda_df.to_csv(tda_path, index=False)
 
+    # Per-window metrics with ground truth for poisoning evaluation (window_id, t, in_poison_region, anomaly_score, flagged).
+    poison_start = config.poison_start_t
+    window_metrics_rows = []
+    for i, row in enumerate(monitor.rows):
+        t = int(row["t"])
+        in_poison_region = (poison_start is not None and t >= poison_start)
+        r = {
+            "window_id": i,
+            "t": t,
+            "in_poison_region": bool(in_poison_region),
+            "anomaly_score": float(row.get("score", float("nan"))),
+            "flagged": bool(row.get("flagged_window", row.get("flag", False))),
+        }
+        for k in [
+            "h0_max_persistence", "h0_count", "h0_entropy",
+            "h0_wasserstein_amplitude", "h0_landscape_amplitude", "h0_betti_curve_mean",
+            "h1_max_persistence", "h1_count", "h1_entropy",
+            "h1_wasserstein_amplitude", "h1_landscape_amplitude", "h1_betti_curve_mean",
+            "threshold",
+        ]:
+            if k in row:
+                r[k] = row[k]
+        window_metrics_rows.append(r)
+    window_metrics_df = pd.DataFrame(window_metrics_rows)
+    window_metrics_path = run_output / "window_metrics.csv"
+    window_metrics_df.to_csv(window_metrics_path, index=False)
+
     detections_df = tda_df[tda_df.get("flag", False).astype(bool)] if not tda_df.empty else tda_df
     detections_path = run_output / "detections.csv"
     detections_df.to_csv(detections_path, index=False)
 
-    # Plots
-    poison_start = config.poison_start_t
-    poison_end = config.poison_end_t
+    # Plot helpers: vertical line at poison onset; no shaded region for one-way (poison_end_t is None).
+    def _poison_onset_line(ax):
+        if poison_start is not None and config.poison_rate > 0.0:
+            ax.axvline(poison_start, color="red", linestyle="--", label="poison onset")
 
-    def _shade_poison(ax):
-        if poison_start is not None and poison_end is not None:
-            ax.axvspan(poison_start, poison_end, color="red", alpha=0.15, label="poison window")
+    thresh_val = getattr(monitor, "_threshold_from_quantile", None)
+    thresh_plot = float(thresh_val) if thresh_val is not None and np.isfinite(thresh_val) else None
 
     # 1) Test accuracy vs t
     if not metrics_df.empty:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(metrics_df["t"], metrics_df["test_accuracy"], marker="o", label="test accuracy")
-        _shade_poison(ax)
+        _poison_onset_line(ax)
         ax.set_xlabel("timestep")
         ax.set_ylabel("test accuracy")
         ax.set_title("Test accuracy over time")
@@ -292,12 +350,13 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         fig.savefig(run_output / "accuracy_over_time.png")
         plt.close(fig)
 
-    # 2) Detection score vs t
+    # 2) Detection score vs t (threshold from empirical quantile)
     if not tda_df.empty and "score" in tda_df.columns:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(tda_df["t"], tda_df["score"], label="detection score")
-        ax.axhline(config.threshold, color="orange", linestyle="--", label="threshold")
-        _shade_poison(ax)
+        if thresh_plot is not None:
+            ax.axhline(thresh_plot, color="orange", linestyle="--", label="threshold")
+        _poison_onset_line(ax)
         ax.set_xlabel("timestep")
         ax.set_ylabel("score (z)")
         ax.set_title("Detection score over time")
@@ -306,25 +365,38 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         fig.savefig(run_output / "detection_score_over_time.png")
         plt.close(fig)
 
-    # 3) h1_max_persistence vs t (fall back to h0 if needed)
+    # 3) TDA features: two subplots (H0 and H1) with independent y-axes
     if not tda_df.empty:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        if "h1_max_persistence" in tda_df.columns:
-            ax.plot(tda_df["t"], tda_df["h1_max_persistence"], label="h1_max_persistence")
+        fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
         if "h0_max_persistence" in tda_df.columns:
-            ax.plot(tda_df["t"], tda_df["h0_max_persistence"], label="h0_max_persistence")
-        _shade_poison(ax)
-        ax.set_xlabel("timestep")
-        ax.set_ylabel("max persistence")
-        ax.set_title("TDA features over time")
-        ax.legend()
+            ax0.plot(tda_df["t"], tda_df["h0_max_persistence"], label="h0_max_persistence")
+        if "h0_count" in tda_df.columns:
+            ax0.plot(tda_df["t"], tda_df["h0_count"], label="h0_count")
+        if "h0_entropy" in tda_df.columns:
+            ax0.plot(tda_df["t"], tda_df["h0_entropy"], label="h0_entropy")
+        ax0.set_ylabel("H0")
+        ax0.set_title("TDA features over time (H0)")
+        ax0.legend()
+        _poison_onset_line(ax0)
+        if "h1_max_persistence" in tda_df.columns:
+            ax1.plot(tda_df["t"], tda_df["h1_max_persistence"], label="h1_max_persistence")
+        if "h1_count" in tda_df.columns:
+            ax1.plot(tda_df["t"], tda_df["h1_count"], label="h1_count")
+        if "h1_entropy" in tda_df.columns:
+            ax1.plot(tda_df["t"], tda_df["h1_entropy"], label="h1_entropy")
+        ax1.set_ylabel("H1")
+        ax1.set_xlabel("timestep")
+        ax1.set_title("H1")
+        ax1.legend()
+        _poison_onset_line(ax1)
         fig.tight_layout()
         fig.savefig(run_output / "tda_features_over_time.png")
         plt.close(fig)
 
-    # Save config (including dataset metadata) for reproducibility.
+    # Save config (including dataset metadata and run summary) for reproducibility.
     config_dict = asdict(config)
     config_dict["dataset_meta"] = dataset_meta
+    config_dict["run_summary"] = {"flip_count": int(flip_count)}
     config_path = run_output / "config.json"
     with config_path.open("w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2)
@@ -333,6 +405,7 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         "config_path": str(config_path),
         "metrics_path": str(metrics_path),
         "tda_features_path": str(tda_path),
+        "window_metrics_path": str(window_metrics_path),
         "detections_path": str(detections_path),
         "n_metrics": int(len(metrics_df)),
         "n_tda_rows": int(len(tda_df)),
@@ -412,6 +485,15 @@ def _build_config_from_args(args: Any) -> ExperimentConfig:
         cfg.poison_rate = args.poison_rate
     if args.poison_mode is not None:
         cfg.poison_mode = args.poison_mode
+    if getattr(args, "poison_start", None) is not None:
+        cfg.poison_start_t = int(args.poison_start)
+    if getattr(args, "poison_end", None) is not None:
+        cfg.poison_end_t = int(args.poison_end)
+    if getattr(args, "trigger_value", None) is not None:
+        cfg.trigger_value = float(args.trigger_value)
+    if getattr(args, "trigger_dims", None) is not None:
+        dims_str = args.trigger_dims.strip()
+        cfg.trigger_dims = [int(d.strip()) for d in dims_str.split(",") if d.strip()]
     if args.point_cloud_mode is not None:
         cfg.point_cloud_mode = args.point_cloud_mode
     if args.output_dir is not None:
@@ -422,6 +504,10 @@ def _build_config_from_args(args: Any) -> ExperimentConfig:
         cfg.cicids_root_dir = args.cicids_root_dir
     if getattr(args, "cicids_file_glob", None) is not None:
         cfg.cicids_file_glob = args.cicids_file_glob
+    if getattr(args, "day", None) is not None:
+        cfg.cicids_file_glob = args.day
+        if cfg.cicids_root_dir is None:
+            cfg.cicids_root_dir = str(Path("data") / "cicids2017")
     if getattr(args, "cicids_max_files", None) is not None:
         cfg.cicids_max_files = args.cicids_max_files
     if getattr(args, "label_col", None) is not None:
@@ -434,11 +520,24 @@ def _build_config_from_args(args: Any) -> ExperimentConfig:
         cfg.max_rows = args.max_rows
     if getattr(args, "condition", None) is not None:
         cfg.condition = args.condition
+    if getattr(args, "score_from", None) is not None:
+        cfg.score_from = args.score_from
     if getattr(args, "seed", None) is not None:
         cfg.seed = args.seed
         # If random_state was not explicitly provided, mirror from seed.
         if args.random_state is None:
             cfg.random_state = cfg.seed
+    # Use CICIDS when --day is provided; ensure root is set.
+    if getattr(args, "day", None) is not None and cfg.cicids_root_dir is None:
+        cfg.cicids_root_dir = str(Path("data") / "cicids2017")
+    # Default condition to label_flip when running poisoning with poison-start.
+    if (
+        getattr(args, "poison_start", None) is not None
+        and args.poison_rate is not None
+        and args.poison_rate > 0
+        and getattr(args, "condition", None) is None
+    ):
+        cfg.condition = "label_flip"
     return cfg
 
 
@@ -451,8 +550,10 @@ def main() -> None:
     parser.add_argument("--n_steps", type=int, default=None, help="Total number of timesteps.")
     parser.add_argument(
         "--poison_rate",
+        "--poison-rate",
         type=float,
         default=None,
+        dest="poison_rate",
         help="Poisoning rate inside the active window.",
     )
     parser.add_argument(
@@ -471,8 +572,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--output_dir",
+        "--output-dir",
         type=str,
         default=None,
+        dest="output_dir",
         help="Directory to write metrics, features, and plots.",
     )
     parser.add_argument(
@@ -512,15 +615,58 @@ def main() -> None:
         help="Per-run seed (also used as random_state if not provided).",
     )
     parser.add_argument(
+        "--score-from",
+        type=str,
+        default=None,
+        dest="score_from",
+        help="Score from mode: h1_then_h0, h1_extended, all, etc.",
+    )
+    parser.add_argument(
         "--run_suite",
         action="store_true",
         help="Run a suite across conditions and seeds instead of a single run.",
     )
     parser.add_argument(
-        "--max_rows", 
-        type=int, 
-        default=None, 
+        "--max_rows",
+        "--max-rows",
+        type=int,
+        default=None,
+        dest="max_rows",
         help="Maximum number of rows to load from the dataset.",
+    )
+    parser.add_argument(
+        "--day",
+        type=str,
+        default=None,
+        help="CICIDS2017 day filter (e.g. 'Monday'); sets cicids_file_glob.",
+    )
+    parser.add_argument(
+        "--poison-start",
+        type=int,
+        default=None,
+        dest="poison_start",
+        help="Timestep at which poisoning begins (one-way if --poison-end not set).",
+    )
+    parser.add_argument(
+        "--poison-end",
+        type=int,
+        default=None,
+        dest="poison_end",
+        help="Optional timestep at which poisoning ends; omit for one-way poison.",
+    )
+    parser.add_argument(
+        "--trigger-value",
+        type=float,
+        default=None,
+        dest="trigger_value",
+        help="Scalar offset added to trigger_dims (in scaled units).",
+    )
+    parser.add_argument(
+        "--trigger-dims",
+        type=str,
+        default=None,
+        dest="trigger_dims",
+        help="Comma-separated feature indices to perturb, e.g. '0' or '0,1,2'.",
     )
     parser.add_argument(
         "--seeds",

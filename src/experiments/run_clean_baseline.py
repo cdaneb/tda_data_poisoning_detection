@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import json
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import balanced_accuracy_score
@@ -220,9 +221,10 @@ def run_clean_baseline(config: CleanBaselineConfig, *, use_cicids: Optional[bool
         n_features=config.n_features,
     )
 
+    # Threshold is derived from calibration-phase scores at threshold_quantile; no fixed threshold.
     monitor = TDAMonitor(
         window_buffer=buffer,
-        threshold=3.0,
+        threshold=0.0,  # Unused when threshold_mode is empirical_quantile
         warmup_windows=config.warmup_windows,
         calibration_windows=config.calibration_windows,
         k_consecutive=config.k_consecutive,
@@ -295,9 +297,15 @@ def run_clean_baseline(config: CleanBaselineConfig, *, use_cicids: Optional[bool
                 "h0_max_persistence",
                 "h0_count",
                 "h0_entropy",
+                "h0_wasserstein_amplitude",
+                "h0_landscape_amplitude",
+                "h0_betti_curve_mean",
                 "h1_max_persistence",
                 "h1_count",
                 "h1_entropy",
+                "h1_wasserstein_amplitude",
+                "h1_landscape_amplitude",
+                "h1_betti_curve_mean",
                 "score",
                 "threshold",
                 "flagged_window",
@@ -329,6 +337,51 @@ def run_clean_baseline(config: CleanBaselineConfig, *, use_cicids: Optional[bool
     window_df = pd.DataFrame(window_rows)
     window_metrics_path = run_output / "window_metrics.csv"
     window_df.to_csv(window_metrics_path, index=False)
+
+    # ------------------------------------------------------------------
+    # Plots from window_metrics (no poison shading — clean baseline only).
+    # ------------------------------------------------------------------
+    if not window_df.empty:
+        # 1) Balanced accuracy over time (per-window)
+        if "balanced_accuracy" in window_df.columns:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(window_df["t"], window_df["balanced_accuracy"], marker="o", label="balanced accuracy", markersize=2)
+            ax.set_xlabel("timestep")
+            ax.set_ylabel("balanced accuracy")
+            ax.set_title("Balanced accuracy over time")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(run_output / "accuracy_over_time.png")
+            plt.close(fig)
+
+        # 2) Detection score over time with empirical threshold
+        if "anomaly_score" in window_df.columns:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(window_df["t"], window_df["anomaly_score"], label="detection score")
+            thresh = getattr(monitor, "_threshold_from_quantile", None)
+            if thresh is not None and np.isfinite(thresh):
+                ax.axhline(float(thresh), color="orange", linestyle="--", label="threshold")
+            ax.set_xlabel("timestep")
+            ax.set_ylabel("score (z)")
+            ax.set_title("Detection score over time")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(run_output / "detection_score_over_time.png")
+            plt.close(fig)
+
+        # 3) TDA features (max persistence) over time
+        fig, ax = plt.subplots(figsize=(6, 4))
+        if "h1_max_persistence" in window_df.columns:
+            ax.plot(window_df["t"], window_df["h1_max_persistence"], label="h1_max_persistence")
+        if "h0_max_persistence" in window_df.columns:
+            ax.plot(window_df["t"], window_df["h0_max_persistence"], label="h0_max_persistence")
+        ax.set_xlabel("timestep")
+        ax.set_ylabel("max persistence")
+        ax.set_title("TDA features over time")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(run_output / "tda_features_over_time.png")
+        plt.close(fig)
 
     # ------------------------------------------------------------------
     # Baseline parameter snapshot (PCA, calibrator, threshold, summary).
@@ -412,6 +465,13 @@ def run_clean_baseline(config: CleanBaselineConfig, *, use_cicids: Optional[bool
     with baseline_params_path.open("w", encoding="utf-8") as f:
         json.dump(baseline_params, f, indent=2)
 
+    # config.json for validation and reproducibility (clean_baseline_config + dataset_meta).
+    config_dict = asdict(config)
+    config_dict["dataset_meta"] = dataset_meta
+    config_path = run_output / "config.json"
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2)
+
     # ------------------------------------------------------------------
     # Printed summary (stdout).
     # ------------------------------------------------------------------
@@ -444,6 +504,7 @@ def run_clean_baseline(config: CleanBaselineConfig, *, use_cicids: Optional[bool
         "output_dir": str(run_output),
         "window_metrics_path": str(window_metrics_path),
         "baseline_params_path": str(baseline_params_path),
+        "config_path": str(config_path),
     }
 
 
@@ -488,6 +549,13 @@ def main() -> None:
         action="store_true",
         help="Use synthetic make_classification stream instead of CICIDS2017.",
     )
+    parser.add_argument(
+        "--score-from",
+        type=str,
+        default=None,
+        dest="score_from",
+        help="Score from mode: h1_then_h0, h1_extended, all, etc.",
+    )
 
     args = parser.parse_args()
 
@@ -499,6 +567,8 @@ def main() -> None:
     cfg.cicids_day = args.day
     cfg.max_rows = args.max_rows
     cfg.use_cicids = not bool(args.synthetic)
+    if getattr(args, "score_from", None) is not None:
+        cfg.score_from = args.score_from
 
     run_clean_baseline(cfg, use_cicids=cfg.use_cicids)
 
