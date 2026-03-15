@@ -45,14 +45,19 @@ This repository provides:
 
 -   Sliding-window point clouds
 -   Vietoris--Rips persistent homology via `ripser`
--   H0 and H1 summaries:
-    -   `max_persistence`
-    -   `persistence_count`
-    -   `persistence_entropy`
+-   H0 and H1 summaries (6 per dimension):
+    -   `max_persistence`, `count`, `entropy`, `wasserstein_amplitude`, `landscape_amplitude`, `betti_curve_mean`
+-   Scoring uses a configurable **score_from** mode; default is **h1_extended** (4 features: max_persistence, count, entropy, wasserstein_amplitude).
 -   PCA dimensionality reduction before PH
 -   Robust z-score calibration (median/MAD)
 -   Empirical quantile thresholding
 -   Per-window detection with consecutive-flag logic
+
+### Scoring Modes
+
+-   **h1_then_h0** — Original 3-feature mode (max_persistence, count, entropy) per dimension; use H1 when non-empty else H0.
+-   **h1_extended** — 4-feature mode adding wasserstein_amplitude; current default and best detection performance in trigger experiments.
+-   **all** — Full 12-feature mode (available for logging/analysis).
 
 ## Clean Baseline Pipeline
 
@@ -138,8 +143,13 @@ python -m src.experiments.run_experiment \
   --poison_rate 0.5 \
   --poison_mode label_flip \
   --point_cloud_mode residuals \
-  --output_dir outputs/experiment_run_1
+  --output_dir outputs/experiment_run_1 \
+  --score-from h1_extended
 ```
+
+**Scoring:** `--score-from` — `h1_then_h0` | `h1_extended` (default) | `all`.
+
+**Trigger/backdoor options:** `--trigger-value` (scalar offset), `--trigger-dims` (comma-separated indices, e.g. `0,1,2`), `--poison-start` (timestep at which poisoning begins).
 
 ------------------------------------------------------------------------
 
@@ -170,8 +180,9 @@ One row per evaluation window including:
 -   `t`, `window_id`
 -   Model metrics: `accuracy`, `balanced_accuracy`, `precision_1`,
     `recall_1`, `f1_1`, `tp`, `fp`, `tn`, `fn`, `attack_prevalence`
--   TDA features: `h0_max_persistence`, `h0_count`, `h0_entropy`,
-    `h1_max_persistence`, `h1_count`, `h1_entropy`
+-   TDA features (12 columns):  
+    H0 — `h0_max_persistence`, `h0_count`, `h0_entropy`, `h0_wasserstein_amplitude`, `h0_landscape_amplitude`, `h0_betti_curve_mean`  
+    H1 — `h1_max_persistence`, `h1_count`, `h1_entropy`, `h1_wasserstein_amplitude`, `h1_landscape_amplitude`, `h1_betti_curve_mean`
 -   Detection fields: `anomaly_score`, `threshold_used`,
     `flagged_window`, `consecutive_flags`, `h1_nonempty`
 -   PCA metadata: `pca_requested`, `pca_effective`, `pca_clamped`,
@@ -194,6 +205,21 @@ A stable clean baseline should exhibit:
 -   Consistent H1 presence frequency
 -   No explosive heavy-tail behavior
 -   Balanced accuracy near 1.0 for all-benign slices
+
+------------------------------------------------------------------------
+
+# Project Scripts
+
+Scripts in `scripts/` used for diagnostics, metrics, and plotting:
+
+-   **cleanup_repo.py** — Remove generated artifacts (`__pycache__`, `.pytest_cache`, optional `--remove-results` / `--remove-outputs`).
+-   **cicids_tuesday_diagnostic.py** — Diagnose Tuesday CICIDS label distribution and attack onset.
+-   **compute_poison_metrics.py** — Compute detection/FPR metrics from poisoning experiment outputs.
+-   **compute_trigger_metrics.py** — Compute trigger-experiment metrics (detection_delay, detection_rate, fpr_pre_onset, etc.).
+-   **compute_trigger_metrics_magnitudes.py** — Trigger metrics with magnitude breakdowns.
+-   **plot_trigger_diagnostics.py** — Plot trigger run diagnostics.
+-   **trigger_consolidated_table.py** — Build consolidated table across trigger configs and scorers.
+-   **h1_feature_shift_table.py** — H1 feature shift analysis table.
 
 ------------------------------------------------------------------------
 
@@ -224,20 +250,16 @@ Optional destructive flags:
 
 ## Current state
 
--   PCA-based dimensionality reduction integrated
--   Robust median/MAD calibration implemented
--   Empirical quantile thresholding implemented
--   Clean baseline validated (low FPR)
--   Full artifact reproducibility enabled
--   Test suite passing
+-   Clean baseline validated on CICIDS Monday (FPR 0.75% with h1_then_h0, 0.82% with h1_extended).
+-   Label-flip poisoning experiments completed: no detection (valid negative result — TDA detects geometric distortion, not label corruption alone).
+-   Trigger/backdoor experiments completed across trigger_value ∈ {1.0, 3.0, 5.0} and trigger_dims ∈ {[0], [0,1,2], [0,1,2,3,4]}; h1_extended outperforms h1_then_h0 in all configs.
+-   CICIDS Tuesday loaded and diagnosed: 6.6% attack prevalence (FTP-Patator), first attack at index 11,333; Tuesday baseline under investigation.
 
 ## Next phase
 
--   Baseline on attack-present CICIDS slices
--   Controlled poisoning experiments
--   Comparative analysis (H0 vs H1 behavior)
--   Sensitivity to window size and PCA dimension
--   Formal statistical evaluation
+-   Stable Tuesday baseline (calibration on pre-attack prefix only).
+-   Label-flip experiment on Tuesday with real attack traffic.
+-   Formal statistical evaluation and paper writeup.
 
 ------------------------------------------------------------------------
 
@@ -249,6 +271,7 @@ Optional destructive flags:
 -   numpy
 -   pandas
 -   matplotlib
+-   seaborn (plots)
 -   pytest
 
 ------------------------------------------------------------------------
